@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install -e '.[dev]'
+      - run: ruff check src tests examples
+      - run: ruff format --check src tests examples
+      - run: python -m pytest
+      - run: python -m fairwitness demo
+      - run: python -m fairwitness chaos --runs 25
+      - run: python examples/inventory_reservation.py
+      - run: python -m build
+      - name: Check the installed wheel outside the checkout
+        run: |
+          python -m venv /tmp/fairwitness-wheel
+          /tmp/fairwitness-wheel/bin/python -m pip install --no-deps dist/*.whl
+          cd /tmp
+          /tmp/fairwitness-wheel/bin/python -c "from fairwitness import FairWitness; print(FairWitness.__name__)"
+          /tmp/fairwitness-wheel/bin/fairwitness --version
+          /tmp/fairwitness-wheel/bin/fairwitness demo

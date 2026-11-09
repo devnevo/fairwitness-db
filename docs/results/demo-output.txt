@@ -1,0 +1,81 @@
+
+========================================================================
+1. The database committed the wrong refund
+========================================================================
+Order #1001: $80.00, paid, nothing refunded yet.
+  [agent ] reads order #1001 -> eligible, $80.00 owed
+  [agent ] ...reasoning (paused)...
+  [worker] payments webhook opens a dispute on order #1001
+  [agent ] resumes and asks for an $80.00 refund
+
+  baseline (agent writes in its own txn)       COMMITTED $80.00               WRONG: refund issued on a disputed order
+  snapshot review (2nd check, same context)    COMMITTED $80.00               WRONG: refund issued on a disputed order
+  plain transaction (hand-written recheck)     REJECTED  order_disputed       ok
+  fairwitness-db                               REJECTED  order_disputed       ok
+  fairwitness-db, strict mode                  REJECTED  stale_evidence       ok
+
+  fairwitness-db receipt (stored in the same transaction as the decision):
+    drift   orders/1001.disputed_seq: None -> 1
+    drift   orders/1001.status: 'paid' -> 'disputed'
+    check   invalid_amount         pass  (amount must be positive)
+    check   order_not_found        pass  (order must exist)
+    check   order_disputed         FAIL  (no refunds while a dispute is open)
+
+  The baseline's transaction was correct and serialized. Its *reason* came from
+  a read outside that transaction. Re-checking the same context (snapshot review)
+  cannot help: it sees what the agent saw.
+
+========================================================================
+2. Two worlds, one context
+========================================================================
+World A: nothing happens while the agent reasons. World B: a dispute opens.
+The agent's context is identical in both, so anything that decides from that
+context alone must act the same in both. Only a check at commit time can tell
+the worlds apart.
+
+  strategy                                     world A (refund due)   world B (disputed)    
+  baseline (agent writes in its own txn)       ok  committed          WRONG committed       
+  snapshot review (2nd check, same context)    ok  committed          WRONG committed       
+  plain transaction (hand-written recheck)     ok  committed          ok  rejected          
+  fairwitness-db                               ok  committed          ok  rejected          
+  fairwitness-db, strict mode                  ok  committed          ok  rejected          
+
+========================================================================
+3. The policy changed while the agent was thinking
+========================================================================
+Order #1003: $120.00. Policy cap: $150.00 per refund.
+  [agent ] reads order and policy -> proposes a $120.00 refund
+  [admin ] lowers the refund cap to $50.00
+
+  baseline (agent writes in its own txn)       COMMITTED $120.00              WRONG: refund above the cap in force
+  fairwitness-db                               REJECTED  exceeds_policy_cap   ok
+    drift   policies/default.max_refund_cents: 15000 -> 5000
+
+========================================================================
+4. Drift that does not matter: revalidate vs strict
+========================================================================
+Order #1002: $45.00. While the agent reasons, another agent refunds a
+different order, so the shared allowance moves from $0.00 to $80.00 used.
+$45.00 still fits easily in the $500.00 allowance.
+
+  fairwitness-db                               COMMITTED $45.00
+    drift   allowances/refunds_daily.used_cents: 0 -> 8000
+  fairwitness-db, strict mode                  REJECTED  stale_evidence
+    drift   allowances/refunds_daily.used_cents: 0 -> 8000
+
+  Default mode re-evaluates the encoded rules on current state and records the
+  drift. Strict mode also rejects changed recorded facts that no rule mentions;
+  it compares current contents, excluding version. Choose for the operation.
+
+========================================================================
+5. The response was lost after the commit
+========================================================================
+  commit  ticket-881:refund refund_order COMMITTED  refund_id=1
+  ...network drops the response; the agent retries the same op_id...
+  retry   ticket-881:refund refund_order COMMITTED [replayed]  refund_id=1
+  refunds on order #1002: 1
+  reuse   same op_id, different amount -> IdempotencyConflict
+
+Takeaway: the fix is a precondition inside the transaction that writes.
+plain_txn proves it needs no framework. fairwitness-db makes that check declarative,
+idempotent and auditable, and lets you test it with fault injection.
